@@ -12,6 +12,7 @@
   R4 リンク完全 … リンク先の .md が実在する
   R5 孤児なし   … ルートから辿れない .md が無い（用語.md はルートから参照済み）
   R6 用語定義   … 監視語（watchlist）が本文に出たら、用語.md の表に定義が要る
+  R7 図の規則   … ルート(00_枠)にmermaid図が1つ以上。横向き図（flowchart LR/graph LR/RL）は禁止
 
 使い方（リポジトリのルートで実行）:
   python eval/oracle.py                 # お手本(samples/reference)を採点 → PASS
@@ -132,6 +133,16 @@ def check_tree(doc_dir: Path) -> list[str]:
         if term in body and not any(term in d or d in term for d in defined):
             violations.append(f"R6違反: 監視語「{term}」が本文に出るが 用語.md に定義が無い")
 
+    # R7 図の規則
+    root_text = root.read_text(encoding="utf-8")
+    if "```mermaid" not in root_text:
+        violations.append(f"R7違反[{ROOT_NAME}]: 全体構成図（mermaid）が無い")
+    import re as _re
+    for p2 in all_md:
+        txt2 = p2.read_text(encoding="utf-8")
+        if _re.search(r"(flowchart|graph)\s+(LR|RL)", txt2):
+            violations.append(f"R7違反[{p2.relative_to(doc_dir).as_posix()}]: 横向きの図（LR/RL）は禁止")
+
     return violations
 
 
@@ -164,6 +175,8 @@ def selftest() -> int:
         "broken_deadlink": "R4違反",
         "broken_orphan": "R5違反",
         "broken_undefined_term": "R6違反",
+        "broken_nodiagram": "R7違反",
+        "broken_sideways": "R7違反",
     }
     for name, code in expects.items():
         v = check_tree(SELFTEST / name)
