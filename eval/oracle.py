@@ -13,11 +13,13 @@
   R5 孤児なし   … ルートから辿れない .md が無い（用語.md はルートから参照済み）
   R6 用語定義   … 監視語（watchlist）が本文に出たら、用語.md の表に定義が要る
   R7 図の規則   … ルート(00_枠)にmermaid図が1つ以上。横向き図（flowchart LR/graph LR/RL）は禁止
+  R8 配置       … 00_入力の不足.md がある／設計の本体は 01_設計/ ／用語.md は 02_学習/
 
 使い方（リポジトリのルートで実行）:
   python eval/oracle.py                 # お手本(samples/reference)を採点 → PASS
   python eval/oracle.py --selftest      # オラクル自身を検証（壊した見本を検出できるか）
   python eval/oracle.py --check <dir>   # 任意の設計書フォルダを採点
+  python eval/oracle.py --gaps <file>   # 入力そのものを点検し、何が書かれていないかを出す
 
 依存: Python 3 標準ライブラリのみ。
 """
@@ -27,6 +29,13 @@ import json
 import re
 import sys
 from pathlib import Path
+
+# Windowsコンソールの文字化け対策（日本語の違反メッセージを読める形で出す）
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 ROOT = Path(__file__).resolve().parent
 REPO = ROOT.parent
@@ -45,8 +54,17 @@ if _rules_file.exists():
     MAX_LINES = _r.get("max_lines", MAX_LINES)
     FRAME_MIN = _r.get("frame_min", FRAME_MIN)
     FRAME_MAX = _r.get("frame_max", FRAME_MAX)
+# 出力の配置（役割がフォルダ名で分かる形。R8で機械検査する）
+#   00_枠.md          … 入口
+#   00_入力の不足.md   … 入力そのものの点検結果
+#   01_設計/          … 設計の本体（要素と、その下の階層）
+#   02_学習/用語.md    … 学習の層
 ROOT_NAME = "00_枠.md"
+GAPS_NAME = "00_入力の不足.md"
+DESIGN_DIR = "01_設計"
+LEARN_DIR = "02_学習"
 GLOSSARY = "用語.md"
+CHECKLIST = ROOT / "corpus" / "input_checklist.json"
 
 LINK_RE = re.compile(r"\]\(([^)#]+\.md)\)")
 
@@ -121,7 +139,7 @@ def check_tree(doc_dir: Path) -> list[str]:
     watch = []
     if WATCHLIST.exists():
         watch = json.loads(WATCHLIST.read_text(encoding="utf-8")).get("terms", [])
-    glossary_file = doc_dir / GLOSSARY
+    glossary_file = doc_dir / LEARN_DIR / GLOSSARY
     defined = set()
     if glossary_file.exists():
         for row in table_data_rows(glossary_file.read_text(encoding="utf-8")):
@@ -143,7 +161,68 @@ def check_tree(doc_dir: Path) -> list[str]:
         if _re.search(r"(flowchart|graph)\s+(LR|RL)", txt2):
             violations.append(f"R7違反[{p2.relative_to(doc_dir).as_posix()}]: 横向きの図（LR/RL）は禁止")
 
+    # R8 配置規則（フォルダ名で役割が分かること）
+    if not (doc_dir / GAPS_NAME).exists():
+        violations.append(f"R8違反: {GAPS_NAME} が無い（入力の点検結果が付いていない）")
+    for p3 in all_md:
+        rel3 = p3.relative_to(doc_dir).as_posix()
+        if rel3 in (ROOT_NAME, GAPS_NAME):
+            continue
+        top = rel3.split("/")[0]
+        if p3.name == GLOSSARY:
+            if top != LEARN_DIR:
+                violations.append(f"R8違反[{rel3}]: {GLOSSARY} は {LEARN_DIR}/ に置く")
+        elif top != DESIGN_DIR:
+            violations.append(f"R8違反[{rel3}]: 設計の本体は {DESIGN_DIR}/ に置く")
+
     return violations
+
+
+# ---------------------------------------------------------------- 入力の点検
+
+def analyze_gaps(text: str) -> list[dict]:
+    """入力テキストを観点表と突き合わせ、観点ごとの有無を返す。
+
+    語で探すため、別の言い回しは取りこぼす。だから「無い」ではなく「見当たらない」
+    と報告する。ここは判定ではなく分析であり、設計書の生成は一切しない。
+    """
+    items = json.loads(CHECKLIST.read_text(encoding="utf-8"))["観点"]
+    out = []
+    for it in items:
+        hit = next((w for w in it["手がかり"] if w in text), None)
+        out.append({
+            "観点": it["観点"],
+            "根拠": hit,
+            "問い": it["問い"],
+            "重大": bool(it.get("重大")),
+        })
+    return out
+
+
+def run_gaps(path: Path) -> int:
+    if not path.exists():
+        print(f"エラー: 入力ファイルが見つかりません → {path}")
+        return 2
+    rows = analyze_gaps(path.read_text(encoding="utf-8", errors="replace"))
+    miss = [r for r in rows if r["根拠"] is None]
+    print(f"入力の点検: {path}")
+    print(f"\n## 見当たらない観点（{len(rows)}観点中 {len(miss)}件）\n")
+    if miss:
+        for r in miss:
+            mark = "★" if r["重大"] else "  "
+            print(f"{mark} {r['観点']}\t{r['問い']}")
+    else:
+        print("   なし")
+    print("\n## 書かれている観点\n")
+    for r in rows:
+        if r["根拠"] is not None:
+            print(f"   {r['観点']}\t（根拠の語: {r['根拠']}）")
+    heavy = [r for r in miss if r["重大"]]
+    print("")
+    if heavy:
+        print(f"★は、欠けると設計書全体が崩れる観点です（{len(heavy)}件）。先に埋めてください。")
+    print("※ 語で探しています。別の言い回しで書かれている場合は取りこぼします。")
+    return 0
 
 
 def run_reference() -> int:
@@ -177,6 +256,8 @@ def selftest() -> int:
         "broken_undefined_term": "R6違反",
         "broken_nodiagram": "R7違反",
         "broken_sideways": "R7違反",
+        "broken_flatlayout": "R8違反",
+        "broken_nogaps": "R8違反",
     }
     for name, code in expects.items():
         v = check_tree(SELFTEST / name)
@@ -187,6 +268,20 @@ def selftest() -> int:
     # 4) 表パーサの単体検証
     rows = table_data_rows("|a|b|\n|---|---|\n|1|2|\n|3|4|\n")
     t("表パーサ: データ行を正しく数える", len(rows) == 2)
+
+    # 5) 入力の点検（--gaps）。生成はせず、何が書かれていないかだけを返すこと
+    full = analyze_gaps((ROOT / "corpus" / "input_full.md").read_text(encoding="utf-8"))
+    thin = analyze_gaps((ROOT / "corpus" / "input_thin.md").read_text(encoding="utf-8"))
+    t("観点表は8観点", len(full) == 8)
+    t("十分な入力では、見当たらない観点が0", not [r for r in full if r["根拠"] is None])
+    thin_missing = {r["観点"] for r in thin if r["根拠"] is None}
+    t("薄い入力で「前提」の欠落を検出する", "前提" in thin_missing)
+    t("薄い入力で「代替案」「失敗時」の欠落も検出する",
+      {"代替案", "失敗時"} <= thin_missing)
+    t("薄い入力でも書かれている観点は欠落と言わない",
+      "目的" not in thin_missing and "完了条件" not in thin_missing)
+    t("欠けた「前提」は重大（★）として印が付く",
+      any(r["観点"] == "前提" and r["重大"] for r in thin))
 
     ok = all(c for _, c in checks)
     for name, cond in checks:
@@ -200,9 +295,13 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--check", metavar="DIR")
+    ap.add_argument("--gaps", metavar="FILE",
+                    help="入力ファイルを点検し、何が書かれていないかを出す（生成はしない）")
     args = ap.parse_args()
     if args.selftest:
         return selftest()
+    if args.gaps:
+        return run_gaps(Path(args.gaps))
     if args.check:
         v = check_tree(Path(args.check))
         for x in v:
