@@ -5,11 +5,12 @@
 
 ## 確認のしかた
 
-- `python eval/oracle.py --selftest` … オラクル自身の検証（37項目。壊した見本12種の検出＋誤検出なし＋入力点検6項目＋HTML出力4項目）
+- `python eval/oracle.py --selftest` … オラクル自身の検証（41項目。壊した見本12種の検出＋誤検出なし＋入力点検6項目＋HTML出力4項目＋図の描画4項目。オフラインでも同結果）
 - `python eval/oracle.py` … お手本（samples/reference）を採点 → PASS
 - `python eval/oracle.py --check <dir>` … 任意の設計書フォルダを採点
 - `python eval/oracle.py --gaps <file>` … 入力そのものを点検し、何が書かれていないかを出す（生成はしない）
-- `python eval/oracle.py --html <dir>` … 設計書ツリーを1枚のHTMLに連結して `<dir>/index.html` に出力（PlantUMLはソースのまま埋め込み）
+- `python eval/oracle.py --html <dir>` … 設計書ツリーを1枚のHTMLに連結して `<dir>/index.html` に出力。
+  **人間が読む正は index.html**（PlantUMLは内蔵描画器でSVG化。対応：コンポーネント/クラス・シーケンス・アクティビティ・ユースケース）
 
 ## 出力の配置（R8で機械検査）
 

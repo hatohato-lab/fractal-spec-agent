@@ -30,8 +30,10 @@
 
 import argparse
 import json
+import os
 import re
 import sys
+import zlib
 from pathlib import Path
 
 # Windowsコンソールの文字化け対策（日本語の違反メッセージを読める形で出す）
@@ -217,7 +219,10 @@ def _anchor(rel: str) -> str:
 # 解釈できない構文が1つでもあれば、図にせずソースのまま出す（黙って壊さない）。
 
 PUML_SUPPORTED = """コンポーネント図: [A] --> [B] / [A] ..> [B] : ラベル
-クラス図(構成): class X / A *-- B / A <.. B : ラベル"""
+クラス図(構成): class X / A *-- B / A <.. B : ラベル
+シーケンス図: participant/actor X / A -> B : ラベル / A --> B : ラベル
+アクティビティ図: start / :動作; / if (条件) then (yes) … else (no) … endif / stop（入れ子if不可）
+ユースケース図: actor X / usecase "名" as U / X --> U : ラベル"""
 
 _PUML_NODE = re.compile(r"\[([^\]]+)\]")
 _PUML_EDGE = re.compile(
@@ -269,8 +274,56 @@ def _puml_parse(src: str):
     return (nodes, edges) if nodes else None
 
 
-def _puml_to_svg(src: str) -> str | None:
-    """縦方向の層に並べたSVGを返す。描けなければ None。"""
+# --- 公式PlantUMLサーバでの描画（第一選択・全図種が公式品質） ---------------
+# 図のソース文字列だけを送って、描画済みSVGを受け取る。
+# ネットが使えない・エラーのときは None を返し、内蔵の簡易描画器へフォールバックする。
+# 無効化: 環境変数 PLANTUML_REMOTE=0 ／ サーバ変更: PLANTUML_SERVER
+
+PLANTUML_SERVER = os.environ.get("PLANTUML_SERVER", "https://www.plantuml.com/plantuml")
+_PUML_B64 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_"
+_remote_cache: dict[str, str | None] = {}
+
+
+def _puml_encode(src: str) -> str:
+    """PlantUML公式のURLエンコード（raw deflate → 独自64進）。"""
+    data = zlib.compress(src.encode("utf-8"), 9)[2:-4]
+    out = []
+    for i in range(0, len(data), 3):
+        b = data[i:i + 3]
+        n = (b[0] << 16) | ((b[1] << 8) if len(b) > 1 else 0) | (b[2] if len(b) > 2 else 0)
+        chunk = [_PUML_B64[(n >> 18) & 63], _PUML_B64[(n >> 12) & 63]]
+        if len(b) > 1:
+            chunk.append(_PUML_B64[(n >> 6) & 63])
+        if len(b) > 2:
+            chunk.append(_PUML_B64[n & 63])
+        out.append("".join(chunk))
+    return "".join(out)
+
+
+def _puml_remote_svg(src: str) -> str | None:
+    """公式サーバで描画したSVGを返す。ネット不可・構文エラー等は None。"""
+    if os.environ.get("PLANTUML_REMOTE", "1") == "0":
+        return None
+    if src in _remote_cache:
+        return _remote_cache[src]
+    svg = None
+    try:
+        import urllib.request
+        url = f"{PLANTUML_SERVER}/svg/{_puml_encode(src)}"
+        # 既定のPython UAはサーバに403で拒否されるため、ブラウザ相当のUAを名乗る
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            text = r.read().decode("utf-8", "replace")
+        i = text.find("<svg")
+        svg = text[i:] if i >= 0 else None
+    except Exception:
+        svg = None
+    _remote_cache[src] = svg
+    return svg
+
+
+def _puml_component_svg(src: str) -> str | None:
+    """コンポーネント図・クラス図を縦方向の層に並べたSVGにする。描けなければ None。"""
     parsed = _puml_parse(src)
     if not parsed:
         return None
@@ -339,6 +392,274 @@ def _puml_to_svg(src: str) -> str | None:
                    f'fill="#000" text-anchor="middle">{_esc(n)}</text>')
     out.append("</svg>")
     return "\n".join(out)
+
+
+def _puml_seq_svg(src: str) -> str | None:
+    """シーケンス図を描く（participant/actor と A -> B : ラベル）。未対応構文があれば None。"""
+    parts: list[str] = []
+    msgs, alias = [], {}
+
+    def ensure(n):
+        if n not in parts:
+            parts.append(n)
+
+    for raw in src.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("@startuml", "@enduml", "'", "skinparam", "hide", "title", "autonumber")):
+            continue
+        m = re.match(r'^(?:participant|actor)\s+"([^"]+)"\s+as\s+(\S+)$', line)
+        if m:
+            alias[m.group(2)] = m.group(1)
+            ensure(m.group(1))
+            continue
+        m = re.match(r"^(?:participant|actor)\s+(\S+)$", line)
+        if m:
+            ensure(m.group(1))
+            continue
+        m = re.match(r"^(\S+?)\s*(-->|->)\s*(\S+?)\s*(?::\s*(.+))?$", line)
+        if m:
+            a, b = alias.get(m.group(1), m.group(1)), alias.get(m.group(3), m.group(3))
+            if a == b:
+                return None
+            ensure(a)
+            ensure(b)
+            msgs.append((a, b, m.group(2) == "-->", (m.group(4) or "").strip()))
+            continue
+        return None
+    if not parts or not msgs:
+        return None
+
+    BW, GX, BH, STEP, PAD = 170, 40, 42, 48, 20
+    xs = {n: PAD + i * (BW + GX) + BW / 2 for i, n in enumerate(parts)}
+    width = PAD * 2 + len(parts) * (BW + GX) - GX
+    height = PAD + BH + (len(msgs) + 1) * STEP
+    out = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {int(width)} {int(height)}" '
+        f'width="100%" style="max-width:{int(width)}px;height:auto" role="img">',
+        '<defs><marker id="sah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" '
+        'markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#000"/></marker></defs>',
+    ]
+    for n in parts:
+        x = xs[n]
+        out.append(f'<rect x="{x - BW / 2:.0f}" y="{PAD}" width="{BW}" height="{BH}" fill="#fff" stroke="#000" stroke-width="1.5"/>')
+        out.append(f'<text x="{x:.0f}" y="{PAD + BH / 2 + 5:.0f}" font-size="15" fill="#000" text-anchor="middle">{_esc(n)}</text>')
+        out.append(f'<line x1="{x:.0f}" y1="{PAD + BH}" x2="{x:.0f}" y2="{height - PAD}" stroke="#000" stroke-width="1" stroke-dasharray="4,4"/>')
+    for i, (a, b, dashed, label) in enumerate(msgs):
+        y = PAD + BH + (i + 1) * STEP
+        x1, x2 = xs[a], xs[b]
+        dash = ' stroke-dasharray="6,4"' if dashed else ""
+        out.append(f'<line x1="{x1:.0f}" y1="{y}" x2="{x2:.0f}" y2="{y}" stroke="#000" stroke-width="1.5"{dash} marker-end="url(#sah)"/>')
+        if label:
+            out.append(f'<text x="{(x1 + x2) / 2:.0f}" y="{y - 6}" font-size="13" fill="#000" text-anchor="middle">{_esc(label)}</text>')
+    out.append("</svg>")
+    return "\n".join(out)
+
+
+def _puml_act_svg(src: str) -> str | None:
+    """アクティビティ図を描く（start・:動作;・if/else/endif・stop）。入れ子ifは未対応で None。"""
+    items, cur, branch = [], None, "then"
+    for raw in src.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("@startuml", "@enduml", "'", "skinparam", "hide", "title")):
+            continue
+        if line == "start":
+            items.append(("start",))
+            continue
+        if line in ("stop", "end"):
+            items.append(("stop",))
+            continue
+        m = re.match(r"^:(.+);$", line)
+        if m:
+            if cur is not None:
+                (cur[3] if branch == "then" else cur[5]).append(m.group(1))
+            else:
+                items.append(("act", m.group(1)))
+            continue
+        m = re.match(r"^if\s*\((.+?)\)\s*then\s*(?:\((.+?)\))?$", line)
+        if m:
+            if cur is not None:
+                return None
+            cur, branch = ["if", m.group(1), m.group(2) or "yes", [], "no", []], "then"
+            continue
+        m = re.match(r"^else\s*(?:\((.+?)\))?$", line)
+        if m and cur is not None:
+            cur[4], branch = m.group(1) or "no", "else"
+            continue
+        if line == "endif" and cur is not None:
+            items.append(tuple(cur))
+            cur = None
+            continue
+        return None
+    if cur is not None or not items:
+        return None
+
+    AW, AH, GAP, BSHIFT = 210, 44, 26, 135
+    has_if = any(i[0] == "if" for i in items)
+    width = 2 * BSHIFT + AW + 40 if has_if else AW + 80
+    cx = width / 2
+
+    def block_h(i):
+        if i[0] in ("start", "stop"):
+            return 24 + GAP
+        if i[0] == "act":
+            return AH + GAP
+        rows = max(len(i[3]), len(i[5]), 1)
+        return 46 + GAP + rows * (AH + GAP) + 8 + GAP
+    height = sum(block_h(i) for i in items) + 30
+    out = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {int(width)} {int(height)}" '
+        f'width="100%" style="max-width:{int(width)}px;height:auto" role="img">',
+        '<defs><marker id="aah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" '
+        'markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#000"/></marker></defs>',
+    ]
+
+    def arrow(x1, y1, x2, y2, label=""):
+        out.append(f'<line x1="{x1:.0f}" y1="{y1:.0f}" x2="{x2:.0f}" y2="{y2:.0f}" stroke="#000" stroke-width="1.5" marker-end="url(#aah)"/>')
+        if label:
+            out.append(f'<text x="{(x1 + x2) / 2 + 8:.0f}" y="{(y1 + y2) / 2 - 4:.0f}" font-size="12" fill="#000">{_esc(label)}</text>')
+
+    def action(x, y, text):
+        out.append(f'<rect x="{x - AW / 2:.0f}" y="{y:.0f}" width="{AW}" height="{AH}" rx="12" fill="#fff" stroke="#000" stroke-width="1.5"/>')
+        out.append(f'<text x="{x:.0f}" y="{y + AH / 2 + 5:.0f}" font-size="14" fill="#000" text-anchor="middle">{_esc(text)}</text>')
+
+    y, prev = 15.0, None
+    for it in items:
+        if it[0] == "start":
+            if prev:
+                arrow(prev[0], prev[1], cx, y - 1)
+            out.append(f'<circle cx="{cx:.0f}" cy="{y + 10:.0f}" r="9" fill="#000"/>')
+            prev = (cx, y + 19)
+            y += 24 + GAP
+        elif it[0] == "stop":
+            if prev:
+                arrow(prev[0], prev[1], cx, y - 1)
+            out.append(f'<circle cx="{cx:.0f}" cy="{y + 10:.0f}" r="10" fill="none" stroke="#000" stroke-width="1.5"/>')
+            out.append(f'<circle cx="{cx:.0f}" cy="{y + 10:.0f}" r="5" fill="#000"/>')
+            prev = (cx, y + 20)
+            y += 24 + GAP
+        elif it[0] == "act":
+            if prev:
+                arrow(prev[0], prev[1], cx, y - 1)
+            action(cx, y, it[1])
+            prev = (cx, y + AH)
+            y += AH + GAP
+        else:
+            _, cond, ylbl, tacts, nlbl, eacts = it
+            dh = 46
+            if prev:
+                arrow(prev[0], prev[1], cx, y - 1)
+            out.append(f'<polygon points="{cx:.0f},{y:.0f} {cx + 95:.0f},{y + dh / 2:.0f} {cx:.0f},{y + dh:.0f} {cx - 95:.0f},{y + dh / 2:.0f}" fill="#fff" stroke="#000" stroke-width="1.5"/>')
+            out.append(f'<text x="{cx:.0f}" y="{y + dh / 2 + 5:.0f}" font-size="13" fill="#000" text-anchor="middle">{_esc(cond)}</text>')
+            rows = max(len(tacts), len(eacts), 1)
+            by = y + dh + GAP
+            lx, rx2 = cx - BSHIFT, cx + BSHIFT
+            arrow(cx - 95, y + dh / 2, lx, by - 1, ylbl)
+            arrow(cx + 95, y + dh / 2, rx2, by - 1, nlbl)
+            yy_l = by
+            for a in tacts:
+                action(lx, yy_l, a)
+                yy_l += AH + GAP
+            yy_r = by
+            for a in eacts:
+                action(rx2, yy_r, a)
+                yy_r += AH + GAP
+            my = by + rows * (AH + GAP) + 4
+            for colx, acts, yy in ((lx, tacts, yy_l), (rx2, eacts, yy_r)):
+                top = (yy - GAP) if acts else (by - 1)
+                out.append(f'<line x1="{colx:.0f}" y1="{top:.0f}" x2="{colx:.0f}" y2="{my:.0f}" stroke="#000" stroke-width="1.5"/>')
+            out.append(f'<line x1="{lx:.0f}" y1="{my:.0f}" x2="{rx2:.0f}" y2="{my:.0f}" stroke="#000" stroke-width="1.5"/>')
+            prev = (cx, my)
+            y = my + GAP
+    out.append("</svg>")
+    return "\n".join(out)
+
+
+def _puml_usecase_svg(src: str) -> str | None:
+    """ユースケース図を描く（左に棒人間・右に楕円）。未対応構文があれば None。"""
+    actors, cases, edges, alias = [], [], [], {}
+    for raw in src.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("@startuml", "@enduml", "'", "skinparam", "hide", "title")):
+            continue
+        m = re.match(r'^actor\s+"([^"]+)"\s+as\s+(\S+)$', line)
+        if m:
+            alias[m.group(2)] = m.group(1)
+            actors.append(m.group(1))
+            continue
+        m = re.match(r"^actor\s+(\S+)$", line)
+        if m:
+            actors.append(m.group(1))
+            continue
+        m = re.match(r'^usecase\s+"([^"]+)"\s+as\s+(\S+)$', line)
+        if m:
+            alias[m.group(2)] = m.group(1)
+            cases.append(m.group(1))
+            continue
+        m = re.match(r"^usecase\s+(\S+)$", line)
+        if m:
+            cases.append(m.group(1))
+            continue
+        m = re.match(r"^(\S+)\s*(?:-->|->|--)\s*(\S+)\s*(?::\s*(.+))?$", line)
+        if m:
+            edges.append((alias.get(m.group(1), m.group(1)), alias.get(m.group(2), m.group(2)), (m.group(3) or "").strip()))
+            continue
+        return None
+    if not actors or not cases:
+        return None
+    known = set(actors) | set(cases)
+    if any(a not in known or b not in known for a, b, _ in edges):
+        return None
+
+    ASP, CSP, PAD, AX, CX2, ERX, ERY = 120, 80, 24, 90, 380, 130, 30
+    height = PAD * 2 + max(len(actors) * ASP, len(cases) * CSP)
+    width = 540
+    ay = {n: PAD + i * ASP + 40 for i, n in enumerate(actors)}
+    cy = {n: PAD + i * CSP + 40 for i, n in enumerate(cases)}
+    out = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {int(height)}" '
+        f'width="100%" style="max-width:{width}px;height:auto" role="img">',
+    ]
+    for a, b, label in edges:
+        if a in ay and b in cy:
+            x1, y1, x2, y2 = AX + 16, ay[a] - 5, CX2 - ERX, cy[b]
+        elif a in cy and b in ay:
+            x1, y1, x2, y2 = CX2 - ERX, cy[a], AX + 16, ay[b] - 5
+        else:
+            return None
+        out.append(f'<line x1="{x1}" y1="{y1:.0f}" x2="{x2}" y2="{y2:.0f}" stroke="#000" stroke-width="1.5"/>')
+        if label:
+            out.append(f'<text x="{(x1 + x2) / 2:.0f}" y="{(y1 + y2) / 2 - 5:.0f}" font-size="12" fill="#000" text-anchor="middle">{_esc(label)}</text>')
+    for n in actors:
+        yy = ay[n]
+        out.append(f'<circle cx="{AX}" cy="{yy - 26:.0f}" r="9" fill="#fff" stroke="#000" stroke-width="1.5"/>')
+        out.append(f'<line x1="{AX}" y1="{yy - 17:.0f}" x2="{AX}" y2="{yy + 6:.0f}" stroke="#000" stroke-width="1.5"/>')
+        out.append(f'<line x1="{AX - 13}" y1="{yy - 8:.0f}" x2="{AX + 13}" y2="{yy - 8:.0f}" stroke="#000" stroke-width="1.5"/>')
+        out.append(f'<line x1="{AX}" y1="{yy + 6:.0f}" x2="{AX - 11}" y2="{yy + 22:.0f}" stroke="#000" stroke-width="1.5"/>')
+        out.append(f'<line x1="{AX}" y1="{yy + 6:.0f}" x2="{AX + 11}" y2="{yy + 22:.0f}" stroke="#000" stroke-width="1.5"/>')
+        out.append(f'<text x="{AX}" y="{yy + 40:.0f}" font-size="14" fill="#000" text-anchor="middle">{_esc(n)}</text>')
+    for n in cases:
+        yy = cy[n]
+        out.append(f'<ellipse cx="{CX2}" cy="{yy:.0f}" rx="{ERX}" ry="{ERY}" fill="#fff" stroke="#000" stroke-width="1.5"/>')
+        out.append(f'<text x="{CX2}" y="{yy + 5:.0f}" font-size="14" fill="#000" text-anchor="middle">{_esc(n)}</text>')
+    out.append("</svg>")
+    return "\n".join(out)
+
+
+def _puml_to_svg(src: str) -> str | None:
+    """PlantUMLをSVGにする。第一選択は公式サーバ描画（全図種・公式品質）。
+    ネット不可なら内蔵の簡易描画器（基本構文のみ）。それも無理なら None（ソース表示）。"""
+    svg = _puml_remote_svg(src)
+    if svg:
+        return svg
+    body = [l.strip() for l in src.splitlines()
+            if l.strip() and not l.strip().startswith(("@startuml", "@enduml", "'", "skinparam", "hide", "title"))]
+    if any(l == "start" or re.match(r"^:.+;$", l) for l in body):
+        return _puml_act_svg(src)
+    if any(l.startswith("usecase") for l in body):
+        return _puml_usecase_svg(src)
+    if any(l.startswith(("participant ", "actor ")) for l in body) or any(re.match(r"^\S+\s*->\s*\S+", l) for l in body):
+        return _puml_seq_svg(src)
+    return _puml_component_svg(src)
 
 
 def _md_to_html(text: str, cur_dir: Path, doc_dir: Path) -> str:
@@ -547,6 +868,8 @@ def run_reference() -> int:
 
 
 def selftest() -> int:
+    # selftest はオフラインでも同じ結果になるよう、サーバ描画を切って内蔵描画器だけを検証する
+    os.environ["PLANTUML_REMOTE"] = "0"
     checks = []
 
     def t(name, cond):
@@ -594,6 +917,18 @@ def selftest() -> int:
       '<figure class="uml">' in html and "<svg" in html and "@startuml" not in html)
     t("HTML出力: 未対応構文はSVGにせずソースのまま出す",
       _puml_to_svg("@startuml\nrobot foo #bar<>\n@enduml") is None)
+
+    # 4.7) 主要な図種（シーケンス・アクティビティ・ユースケース）がSVGになること
+    seq = "@startuml\nactor 本人\nparticipant AI\n本人 -> AI : 一言答える\nAI --> 本人 : 結果を報告\n@enduml"
+    t("PlantUML: シーケンス図がSVGになる", (_puml_to_svg(seq) or "").startswith("<svg"))
+    act = ("@startuml\nstart\n:条件を書く;\nif (揃った?) then (yes)\n:次へ進む;\n"
+           "else (no)\n:続ける;\nendif\nstop\n@enduml")
+    t("PlantUML: アクティビティ図がSVGになる", (_puml_to_svg(act) or "").startswith("<svg"))
+    uc = '@startuml\nactor 本人\nusecase "条件を決める" as U1\n本人 --> U1\n@enduml'
+    t("PlantUML: ユースケース図がSVGになる", (_puml_to_svg(uc) or "").startswith("<svg"))
+    enc = _puml_encode("@startuml\nA -> B\n@enduml")
+    t("PlantUML: サーバ用URLエンコードが正しい文字集合で生成される",
+      enc and all(c in _PUML_B64 for c in enc))
 
     # 5) 入力の点検（--gaps）。生成はせず、何が書かれていないかだけを返すこと
     full = analyze_gaps((ROOT / "corpus" / "input_full.md").read_text(encoding="utf-8"))
