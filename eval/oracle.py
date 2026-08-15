@@ -192,6 +192,136 @@ def _anchor(rel: str) -> str:
     return rel[:-3] if rel.endswith(".md") else rel
 
 
+# --- PlantUML → インラインSVG -----------------------------------------------
+# 外部サーバもJavaも使わず、ブラウザだけで図が見えるようにする。
+# 対応するのは、この設計書で使う範囲の構文に限る（下の PUML_SUPPORTED）。
+# 解釈できない構文が1つでもあれば、図にせずソースのまま出す（黙って壊さない）。
+
+PUML_SUPPORTED = """コンポーネント図: [A] --> [B] / [A] ..> [B] : ラベル
+クラス図(構成): class X / A *-- B / A <.. B : ラベル"""
+
+_PUML_NODE = re.compile(r"\[([^\]]+)\]")
+_PUML_EDGE = re.compile(
+    r"^\s*(?:\[([^\]]+)\]|(\w+))\s*(\*--|<\.\.|\.\.>|-->|--)\s*"
+    r"(?:\[([^\]]+)\]|(\w+))\s*(?::\s*(.+?))?\s*$"
+)
+
+
+def _puml_parse(src: str):
+    """PlantUMLソースを (ノード順, 辺) に還元する。未対応構文があれば None。
+
+    別名（`class "表示名" as F`）は表示名に解決してから辺をつなぐ。
+    """
+    nodes, edges, alias = [], [], {}
+
+    def add(n):
+        if n not in nodes:
+            nodes.append(n)
+
+    def name(x):
+        return alias.get(x, x)
+
+    for raw in src.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("@startuml", "@enduml", "'", "skinparam", "hide", "title")):
+            continue
+        if line == "}":
+            continue
+        # class "表示名" as 別名  ／  class 名前  ／  class 名前 { ... }
+        m = re.match(r'^class\s+"([^"]+)"\s+as\s+(\w+)\s*\{?[^}]*\}?\s*$', line)
+        if m:
+            alias[m.group(2)] = m.group(1)
+            add(m.group(1))
+            continue
+        m = re.match(r"^class\s+(\w+)\s*\{?[^}]*\}?\s*$", line)
+        if m:
+            add(m.group(1))
+            continue
+        m = _PUML_EDGE.match(line)
+        if m:
+            a = name(m.group(1) or m.group(2))
+            arrow, label = m.group(3), m.group(6) or ""
+            b = name(m.group(4) or m.group(5))
+            add(a)
+            add(b)
+            edges.append((a, b, arrow, label))
+            continue
+        return None  # 未対応の行があった
+    return (nodes, edges) if nodes else None
+
+
+def _puml_to_svg(src: str) -> str | None:
+    """縦方向の層に並べたSVGを返す。描けなければ None。"""
+    parsed = _puml_parse(src)
+    if not parsed:
+        return None
+    nodes, edges = parsed
+
+    # 層を決める（親→子の辺で1段下げる。循環しても止まる）
+    layer = {n: 0 for n in nodes}
+    for _ in range(len(nodes)):
+        changed = False
+        for a, b, arrow, _lbl in edges:
+            want = layer[a] + 1
+            if arrow in ("<..",):      # b が a を使う向き（矢印は逆）
+                want = layer[b] + 1
+                if layer[a] < want:
+                    layer[a], changed = want, True
+                continue
+            if layer[b] < want:
+                layer[b], changed = want, True
+        if not changed:
+            break
+
+    rows: dict[int, list[str]] = {}
+    for n in nodes:
+        rows.setdefault(layer[n], []).append(n)
+
+    BW, BH, GX, GY, PAD = 190, 46, 34, 74, 20
+    width = max(len(v) for v in rows.values()) * (BW + GX) - GX + PAD * 2
+    height = (max(rows) + 1) * (BH + GY) - GY + PAD * 2
+    pos = {}
+    for ly, names in rows.items():
+        total = len(names) * (BW + GX) - GX
+        x0 = (width - total) / 2
+        for i, n in enumerate(names):
+            pos[n] = (x0 + i * (BW + GX), PAD + ly * (BH + GY))
+
+    out = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {int(width)} {int(height)}" '
+        f'width="100%" style="max-width:{int(width)}px;height:auto" role="img">',
+        '<defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" '
+        'markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#000"/></marker>'
+        '<marker id="dm" viewBox="0 0 12 12" refX="11" refY="6" markerWidth="9" '
+        'markerHeight="9" orient="auto"><path d="M0,6 L6,1 L12,6 L6,11 z" fill="#000"/>'
+        '</marker></defs>',
+    ]
+    for a, b, arrow, label in edges:
+        if a not in pos or b not in pos:
+            continue
+        ax, ay = pos[a]
+        bx, by = pos[b]
+        x1, y1 = ax + BW / 2, ay + BH
+        x2, y2 = bx + BW / 2, by
+        if ay > by:  # 下から上へ向かう辺
+            y1, y2 = ay, by + BH
+        dash = ' stroke-dasharray="6,4"' if arrow in ("..>", "<..") else ""
+        head = "dm" if arrow == "*--" else "ah"
+        out.append(f'<line x1="{x1:.0f}" y1="{y1:.0f}" x2="{x2:.0f}" y2="{y2:.0f}" '
+                   f'stroke="#000" stroke-width="1.5"{dash} marker-end="url(#{head})"/>')
+        if label:
+            out.append(f'<text x="{(x1 + x2) / 2:.0f}" y="{(y1 + y2) / 2:.0f}" '
+                       f'font-size="13" fill="#000" text-anchor="middle" '
+                       f'dy="-4">{_esc(label)}</text>')
+    for n, (x, y) in pos.items():
+        out.append(f'<rect x="{x:.0f}" y="{y:.0f}" width="{BW}" height="{BH}" '
+                   f'fill="#fff" stroke="#000" stroke-width="1.5"/>')
+        out.append(f'<text x="{x + BW / 2:.0f}" y="{y + BH / 2 + 5:.0f}" font-size="15" '
+                   f'fill="#000" text-anchor="middle">{_esc(n)}</text>')
+    out.append("</svg>")
+    return "\n".join(out)
+
+
 def _md_to_html(text: str, cur_dir: Path, doc_dir: Path) -> str:
     """最小のMarkdown→HTML変換（この設計書ツリーで使う記法のみ対応）。
 
@@ -223,8 +353,16 @@ def _md_to_html(text: str, cur_dir: Path, doc_dir: Path) -> str:
             while i < len(lines) and not lines[i].strip().startswith("```"):
                 block.append(lines[i])
                 i += 1
-            cls = ' class="uml"' if lang in ("plantuml", "puml") else ""
-            out.append(f"<pre{cls}>{_esc(chr(10).join(block))}</pre>")
+            src = chr(10).join(block)
+            if lang in ("plantuml", "puml"):
+                svg = _puml_to_svg(src)
+                if svg:
+                    out.append(f'<figure class="uml">{svg}</figure>')
+                else:
+                    # 解釈できない構文。黙って壊さず、ソースを見せる
+                    out.append(f'<pre class="uml">{_esc(src)}</pre>')
+            else:
+                out.append(f"<pre>{_esc(src)}</pre>")
         elif s.startswith("|"):
             rows = []
             while i < len(lines) and lines[i].strip().startswith("|"):
@@ -256,8 +394,8 @@ def _md_to_html(text: str, cur_dir: Path, doc_dir: Path) -> str:
 def build_html(doc_dir: Path) -> str:
     """設計書ツリーを、リンク順（ルートから深さ優先）で1枚のHTMLにまとめる。
 
-    PlantUMLはレンダリングせず、ソースのまま <pre class="uml"> で埋め込む
-    （外部サーバに依存させないため。VSCode拡張やPlantUMLサーバに貼れば描画できる）。
+    PlantUMLはインラインSVGに変換して埋め込む（外部サーバもJavaも使わない）。
+    未対応の構文が混じっていた図だけ、ソースのまま <pre class="uml"> で出す。
     """
     doc_dir = doc_dir.resolve()
     root = find_root(doc_dir)
@@ -300,8 +438,11 @@ def build_html(doc_dir: Path) -> str:
         "table{border-collapse:collapse;margin:1em 0}th,td{border:1px solid #999;"
         "padding:.4em .7em;font-size:16px}th{background:#ebebeb}"
         "pre{background:#f5f5f5;border:1px solid #999;padding:1em;overflow-x:auto;font-size:14px}"
-        "pre.uml::before{content:'PlantUML（ソース）';display:block;color:#333;font-size:13px;"
-        "margin-bottom:.5em}section{border-left:3px solid #ccc;padding-left:1em;margin:1.5em 0}"
+        "pre.uml::before{content:'PlantUML（未対応構文のためソース表示）';display:block;color:#333;"
+        "font-size:13px;margin-bottom:.5em}"
+        "figure.uml{margin:1em 0;padding:1em;border:1px solid #999;background:#fff;"
+        "overflow-x:auto;text-align:center}"
+        "section{border-left:3px solid #ccc;padding-left:1em;margin:1.5em 0}"
         ".path{color:#333;font-size:13px}a{color:#0645ad}"
     )
     return (
@@ -324,7 +465,9 @@ def run_html(doc_dir: Path) -> int:
     out = doc_dir / "index.html"
     out.write_text(html, encoding="utf-8")
     print(f"出力: {out}")
-    print("※ PlantUMLはソースのまま埋め込んでいます（描画はVSCode拡張やPlantUMLサーバで）")
+    n_svg = html.count('<figure class="uml">')
+    n_src = html.count('<pre class="uml">')
+    print(f"※ PlantUML: {n_svg}枚をSVGで描画" + (f"／{n_src}枚は未対応構文のためソース表示" if n_src else ""))
     return 0
 
 
@@ -421,10 +564,15 @@ def selftest() -> int:
 
     # 4.5) HTML出力（--html）。1枚に全ノードが入り、.mdリンクがアンカー化されること
     html = build_html(REFERENCE)
-    t("HTML出力: ルートの題とPlantUMLソースを含む",
-      "フラクタル設計書ジェネレータ" in html and "@startuml" in html)
+    t("HTML出力: ルートの題を含む", "フラクタル設計書ジェネレータ" in html)
     t("HTML出力: .mdへのリンクが残らずアンカー化される",
       ".md\"" not in html and 'href="#01_設計/要素1_目的"' in html)
+
+    # 4.6) PlantUMLが図（SVG）になること。ソースのまま残っていないこと
+    t("HTML出力: PlantUMLがSVGとして描画される",
+      '<figure class="uml">' in html and "<svg" in html and "@startuml" not in html)
+    t("HTML出力: 未対応構文はSVGにせずソースのまま出す",
+      _puml_to_svg("@startuml\nrobot foo #bar<>\n@enduml") is None)
 
     # 5) 入力の点検（--gaps）。生成はせず、何が書かれていないかだけを返すこと
     full = analyze_gaps((ROOT / "corpus" / "input_full.md").read_text(encoding="utf-8"))
