@@ -15,6 +15,8 @@
   R7 図の規則   … ルート(00_枠)にPlantUML図（@startuml）が1つ以上。
                   横向き指定（left to right direction／mermaidのLR/RL）は禁止
   R8 配置       … 00_入力の不足.md がある／設計の本体は 01_設計/ ／用語.md は 02_学習/
+  R9 推定の隔離 … AIの推定は 03_推定/ の中だけ。【推定】タグが本文に出たら違反。
+                  03_推定/ の表の全行に状態（未確認／採用済）が要る
 
 使い方（リポジトリのルートで実行）:
   python eval/oracle.py                 # お手本(samples/reference)を採点 → PASS
@@ -61,11 +63,14 @@ if _rules_file.exists():
 #   00_入力の不足.md   … 入力そのものの点検結果
 #   01_設計/          … 設計の本体（要素と、その下の階層）
 #   02_学習/用語.md    … 学習の層
+#   03_推定/          … （任意）AIが推定した補完候補の隔離場所（R9で機械検査）
 ROOT_NAME = "00_枠.md"
 GAPS_NAME = "00_入力の不足.md"
 DESIGN_DIR = "01_設計"
 LEARN_DIR = "02_学習"
 GLOSSARY = "用語.md"
+ESTIMATE_DIR = "03_推定"
+ESTIMATE_TAG = "【推定】"
 CHECKLIST = ROOT / "corpus" / "input_checklist.json"
 
 LINK_RE = re.compile(r"\]\(([^)#]+\.md)\)")
@@ -116,10 +121,12 @@ def check_tree(doc_dir: Path) -> list[str]:
             violations.append(f"R1違反[{rel}]: {len(lines)}行（上限{MAX_LINES}）")
 
         rows = table_data_rows(text)
+        is_estimate = rel.split("/")[0] == ESTIMATE_DIR
         if p.name != GLOSSARY:
             if not rows:
                 violations.append(f"R3違反[{rel}]: 表（枠）が無い")
-            elif not (FRAME_MIN <= len(rows) <= FRAME_MAX):
+            elif not is_estimate and not (FRAME_MIN <= len(rows) <= FRAME_MAX):
+                # 推定の表は件数が入力次第で変わるため、枠の行数制限（R2）の対象外
                 violations.append(f"R2違反[{rel}]: 枠の行数 {len(rows)}（許容{FRAME_MIN}〜{FRAME_MAX}）")
 
         if p.resolve() != root.resolve() and p.name != GLOSSARY and "上へ戻る" not in text:
@@ -175,8 +182,20 @@ def check_tree(doc_dir: Path) -> list[str]:
         if p3.name == GLOSSARY:
             if top != LEARN_DIR:
                 violations.append(f"R8違反[{rel3}]: {GLOSSARY} は {LEARN_DIR}/ に置く")
-        elif top != DESIGN_DIR:
+        elif top not in (DESIGN_DIR, ESTIMATE_DIR):
             violations.append(f"R8違反[{rel3}]: 設計の本体は {DESIGN_DIR}/ に置く")
+
+    # R9 推定の隔離（AIが推定した未確認情報を、確定した本文に混ぜない）
+    for p4 in all_md:
+        rel4 = p4.relative_to(doc_dir).as_posix()
+        text4 = p4.read_text(encoding="utf-8")
+        if rel4.split("/")[0] == ESTIMATE_DIR:
+            for row in table_data_rows(text4):
+                if "未確認" not in row and "採用済" not in row:
+                    violations.append(f"R9違反[{rel4}]: 状態（未確認／採用済）の無い推定行がある")
+        elif ESTIMATE_TAG in text4:
+            violations.append(
+                f"R9違反[{rel4}]: {ESTIMATE_TAG}タグが本文に混入している（推定は {ESTIMATE_DIR}/ に隔離する）")
 
     return violations
 
@@ -551,6 +570,8 @@ def selftest() -> int:
         "broken_sideways": "R7違反",
         "broken_flatlayout": "R8違反",
         "broken_nogaps": "R8違反",
+        "broken_estimate_in_body": "R9違反",
+        "broken_estimate_unmarked": "R9違反",
     }
     for name, code in expects.items():
         v = check_tree(SELFTEST / name)

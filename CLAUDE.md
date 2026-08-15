@@ -5,7 +5,7 @@
 
 ## 確認のしかた
 
-- `python eval/oracle.py --selftest` … オラクル自身の検証（33項目。壊した見本10種の検出＋誤検出なし＋入力点検6項目＋HTML出力4項目）
+- `python eval/oracle.py --selftest` … オラクル自身の検証（37項目。壊した見本12種の検出＋誤検出なし＋入力点検6項目＋HTML出力4項目）
 - `python eval/oracle.py` … お手本（samples/reference）を採点 → PASS
 - `python eval/oracle.py --check <dir>` … 任意の設計書フォルダを採点
 - `python eval/oracle.py --gaps <file>` … 入力そのものを点検し、何が書かれていないかを出す（生成はしない）
@@ -18,7 +18,8 @@
 ├── 00_枠.md            入口
 ├── 00_入力の不足.md     入力の点検結果
 ├── 01_設計/            設計の本体
-└── 02_学習/用語.md      学習の層
+├── 02_学習/用語.md      学習の層
+└── 03_推定/推定.md      AIの推定の隔離場所（R9。全行に未確認／採用済の印）
 ```
 
 ## いじるときの約束
