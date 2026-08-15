@@ -5,7 +5,7 @@
 
 ## 確認のしかた
 
-- `python eval/oracle.py --selftest` … オラクル自身の検証（31項目。壊した見本10種の検出＋誤検出なし＋入力点検6項目＋HTML出力2項目）
+- `python eval/oracle.py --selftest` … オラクル自身の検証（33項目。壊した見本10種の検出＋誤検出なし＋入力点検6項目＋HTML出力4項目）
 - `python eval/oracle.py` … お手本（samples/reference）を採点 → PASS
 - `python eval/oracle.py --check <dir>` … 任意の設計書フォルダを採点
 - `python eval/oracle.py --gaps <file>` … 入力そのものを点検し、何が書かれていないかを出す（生成はしない）

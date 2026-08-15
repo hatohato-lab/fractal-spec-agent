@@ -3,6 +3,13 @@
 要件・Issue・問題意識から、**フラクタル構造の設計書**（枠1枚→要素→また枠）と**学習の層**（用語集）を生成するエージェント ＋ 構造を機械検査するオラクル。
 Generates fractal design docs (one frame → elements → frames again) with a built-in learning layer, verified by a deterministic document-structure oracle.
 
+## 入力と出力（これだけ知れば使える）
+
+| | 内容 |
+|---|---|
+| **入力** | やりたいこと・悩み・要件を書いたもの。**形式は何でもよい**（テキスト・PDF・Excel・画像・複数ファイル可。粗くてよい） |
+| **出力** | 読める設計書一式（1枚だけ読めば全体が分かり、分からない所だけ開ける）＋入力に足りない観点の一覧。1枚のHTMLにもできる |
+
 ## 背景
 
 AIは一晩で大量に作れるが、人間が一度に把握できる量は変わらない。
@@ -67,7 +74,7 @@ python eval/oracle.py --gaps 要件メモ.md
 
 ```bash
 python eval/oracle.py            # お手本の設計書を採点 → PASS
-python eval/oracle.py --selftest # オラクル自身を検証（31項目） → PASS
+python eval/oracle.py --selftest # オラクル自身を検証（33項目） → PASS
 python eval/oracle.py --check <フォルダ>   # 自分の設計書を採点
 python eval/oracle.py --gaps <入力ファイル> # 入力に何が書かれていないかを出す
 python eval/oracle.py --html <フォルダ>    # 設計書を1枚のHTMLに連結（index.html）
@@ -100,7 +107,7 @@ flowchart TD
   O -->|"PASS"| H["人間が読む<br/>枠だけ→分からない所だけ開く"]
 ```
 
-## オラクルの信頼性（--selftest・31項目）
+## オラクルの信頼性（--selftest・33項目）
 
 - お手本と最小ツリーが合格すること（誤検出ゼロ）
 - わざと壊した見本**10種**（長すぎ・枠過大・戻るリンク欠落・リンク切れ・孤児・用語未定義・図なし・横向き図・配置違反・入力点検なし）を、**それぞれ正しい規則として**検出すること（1見本1違反で判別まで検証）
