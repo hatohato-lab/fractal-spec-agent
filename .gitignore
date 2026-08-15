@@ -12,3 +12,6 @@ candidate_verdicts.json
 
 # 実環境で生成したサンプル（個人環境のパスを含むため公開しない）
 samples/generated_*/
+
+# --html の生成物（ソースの.mdが正。HTMLは各自が生成する）
+samples/reference/index.html

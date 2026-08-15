@@ -12,7 +12,8 @@
   R4 リンク完全 … リンク先の .md が実在する
   R5 孤児なし   … ルートから辿れない .md が無い（用語.md はルートから参照済み）
   R6 用語定義   … 監視語（watchlist）が本文に出たら、用語.md の表に定義が要る
-  R7 図の規則   … ルート(00_枠)にmermaid図が1つ以上。横向き図（flowchart LR/graph LR/RL）は禁止
+  R7 図の規則   … ルート(00_枠)にPlantUML図（@startuml）が1つ以上。
+                  横向き指定（left to right direction／mermaidのLR/RL）は禁止
   R8 配置       … 00_入力の不足.md がある／設計の本体は 01_設計/ ／用語.md は 02_学習/
 
 使い方（リポジトリのルートで実行）:
@@ -20,6 +21,7 @@
   python eval/oracle.py --selftest      # オラクル自身を検証（壊した見本を検出できるか）
   python eval/oracle.py --check <dir>   # 任意の設計書フォルダを採点
   python eval/oracle.py --gaps <file>   # 入力そのものを点検し、何が書かれていないかを出す
+  python eval/oracle.py --html <dir>    # 設計書ツリーを1枚のHTMLにまとめて <dir>/index.html に出力
 
 依存: Python 3 標準ライブラリのみ。
 """
@@ -151,15 +153,16 @@ def check_tree(doc_dir: Path) -> list[str]:
         if term in body and not any(term in d or d in term for d in defined):
             violations.append(f"R6違反: 監視語「{term}」が本文に出るが 用語.md に定義が無い")
 
-    # R7 図の規則
+    # R7 図の規則（PlantUML）
     root_text = root.read_text(encoding="utf-8")
-    if "```mermaid" not in root_text:
-        violations.append(f"R7違反[{ROOT_NAME}]: 全体構成図（mermaid）が無い")
-    import re as _re
+    if "@startuml" not in root_text:
+        violations.append(f"R7違反[{ROOT_NAME}]: 全体構成図（PlantUML @startuml）が無い")
+    fence_re = re.compile(r"```.*?```", re.S)
     for p2 in all_md:
-        txt2 = p2.read_text(encoding="utf-8")
-        if _re.search(r"(flowchart|graph)\s+(LR|RL)", txt2):
-            violations.append(f"R7違反[{p2.relative_to(doc_dir).as_posix()}]: 横向きの図（LR/RL）は禁止")
+        # 横向き指定は「図の中」だけを検査する（規則の説明文が語を含んでも誤検出しない）
+        code = "\n".join(fence_re.findall(p2.read_text(encoding="utf-8")))
+        if "left to right direction" in code or re.search(r"(flowchart|graph)\s+(LR|RL)", code):
+            violations.append(f"R7違反[{p2.relative_to(doc_dir).as_posix()}]: 横向きの図（left to right direction／LR/RL）は禁止")
 
     # R8 配置規則（フォルダ名で役割が分かること）
     if not (doc_dir / GAPS_NAME).exists():
@@ -176,6 +179,153 @@ def check_tree(doc_dir: Path) -> list[str]:
             violations.append(f"R8違反[{rel3}]: 設計の本体は {DESIGN_DIR}/ に置く")
 
     return violations
+
+
+# ---------------------------------------------------------------- HTML出力
+
+def _esc(s: str) -> str:
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _anchor(rel: str) -> str:
+    """相対パス → アンカーID（.md を落とすだけ。日本語はそのまま使える）。"""
+    return rel[:-3] if rel.endswith(".md") else rel
+
+
+def _md_to_html(text: str, cur_dir: Path, doc_dir: Path) -> str:
+    """最小のMarkdown→HTML変換（この設計書ツリーで使う記法のみ対応）。
+
+    対応: 見出し / 表 / フェンスコード（plantumlはソースのまま<pre>埋め込み）/
+          リンク（.mdはページ内アンカー化）/ 太字 / インラインコード / 箇条書き / 段落
+    """
+    def inline(s: str) -> str:
+        s = _esc(s)
+        s = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", s)
+        s = re.sub(r"`([^`]+)`", r"<code>\1</code>", s)
+
+        def link(m):
+            label, url = m.group(1), m.group(2)
+            if url.endswith(".md"):
+                t = (cur_dir / url).resolve()
+                try:
+                    return f'<a href="#{_anchor(t.relative_to(doc_dir).as_posix())}">{label}</a>'
+                except ValueError:
+                    return label
+            return f'<a href="{url}">{label}</a>'
+        return re.sub(r"\[([^\]]+)\]\(([^)]+)\)", link, s)
+
+    out, lines, i = [], text.splitlines(), 0
+    while i < len(lines):
+        s = lines[i].strip()
+        if s.startswith("```"):
+            lang = s[3:].strip()
+            block, i = [], i + 1
+            while i < len(lines) and not lines[i].strip().startswith("```"):
+                block.append(lines[i])
+                i += 1
+            cls = ' class="uml"' if lang in ("plantuml", "puml") else ""
+            out.append(f"<pre{cls}>{_esc(chr(10).join(block))}</pre>")
+        elif s.startswith("|"):
+            rows = []
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                r = lines[i].strip()
+                if not re.match(r"^\|[\s:|-]+\|$", r):
+                    rows.append([inline(c.strip()) for c in r.strip("|").split("|")])
+                i += 1
+            i -= 1
+            if rows:
+                head = "".join(f"<th>{c}</th>" for c in rows[0])
+                body = "".join("<tr>" + "".join(f"<td>{c}</td>" for c in r) + "</tr>" for r in rows[1:])
+                out.append(f"<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>")
+        elif s.startswith("#"):
+            level = min(len(s) - len(s.lstrip("#")) + 1, 4)  # 階層を1段下げる（h1はページ題）
+            out.append(f"<h{level}>{inline(s.lstrip('#').strip())}</h{level}>")
+        elif s.startswith("- "):
+            items = []
+            while i < len(lines) and lines[i].strip().startswith("- "):
+                items.append(f"<li>{inline(lines[i].strip()[2:])}</li>")
+                i += 1
+            i -= 1
+            out.append("<ul>" + "".join(items) + "</ul>")
+        elif s:
+            out.append(f"<p>{inline(s)}</p>")
+        i += 1
+    return "\n".join(out)
+
+
+def build_html(doc_dir: Path) -> str:
+    """設計書ツリーを、リンク順（ルートから深さ優先）で1枚のHTMLにまとめる。
+
+    PlantUMLはレンダリングせず、ソースのまま <pre class="uml"> で埋め込む
+    （外部サーバに依存させないため。VSCode拡張やPlantUMLサーバに貼れば描画できる）。
+    """
+    doc_dir = doc_dir.resolve()
+    root = find_root(doc_dir)
+    if root is None:
+        raise FileNotFoundError(f"{ROOT_NAME} が無い: {doc_dir}")
+
+    order, seen = [], set()
+
+    def visit(p: Path, depth: int):
+        rp = p.resolve()
+        if rp in seen or not rp.exists():
+            return
+        seen.add(rp)
+        order.append((rp, depth))
+        for target in LINK_RE.findall(rp.read_text(encoding="utf-8")):
+            visit(rp.parent / target, depth + 1)
+
+    visit(root, 0)
+    for p in sorted(doc_dir.rglob("*.md")):  # 孤児も末尾に含める（取りこぼさない）
+        visit(p, 1)
+
+    title = "設計書"
+    m = re.match(r"#\s+(.+)", root.read_text(encoding="utf-8"))
+    if m:
+        title = re.sub(r"[—-].*", "", m.group(1)).strip()
+
+    sections = []
+    for p, depth in order:
+        rel = p.relative_to(doc_dir).as_posix()
+        body = _md_to_html(p.read_text(encoding="utf-8"), p.parent, doc_dir)
+        sections.append(
+            f'<section id="{_anchor(rel)}" style="margin-left:{depth * 1.5}em">\n'
+            f'<div class="path">{_esc(rel)}</div>\n{body}\n</section>'
+        )
+
+    css = (
+        "body{background:#fff;color:#000;font-family:Meiryo,'Hiragino Kaku Gothic ProN',"
+        "'Yu Gothic',sans-serif;font-size:17px;line-height:1.8;max-width:60em;margin:0 auto;"
+        "padding:2em 1em}h1,h2,h3,h4{border-bottom:2px solid #000;padding-bottom:.2em}"
+        "table{border-collapse:collapse;margin:1em 0}th,td{border:1px solid #999;"
+        "padding:.4em .7em;font-size:16px}th{background:#ebebeb}"
+        "pre{background:#f5f5f5;border:1px solid #999;padding:1em;overflow-x:auto;font-size:14px}"
+        "pre.uml::before{content:'PlantUML（ソース）';display:block;color:#333;font-size:13px;"
+        "margin-bottom:.5em}section{border-left:3px solid #ccc;padding-left:1em;margin:1.5em 0}"
+        ".path{color:#333;font-size:13px}a{color:#0645ad}"
+    )
+    return (
+        "<!DOCTYPE html>\n<html lang=\"ja\">\n<head>\n<meta charset=\"utf-8\">\n"
+        f"<title>{_esc(title)}</title>\n<style>{css}</style>\n</head>\n<body>\n"
+        + "\n".join(sections)
+        + "\n</body>\n</html>\n"
+    )
+
+
+def run_html(doc_dir: Path) -> int:
+    if not doc_dir.is_dir():
+        print(f"エラー: フォルダが見つかりません → {doc_dir}")
+        return 2
+    try:
+        html = build_html(doc_dir)
+    except FileNotFoundError as e:
+        print(f"エラー: {e}")
+        return 2
+    out = doc_dir / "index.html"
+    out.write_text(html, encoding="utf-8")
+    print(f"出力: {out}")
+    print("※ PlantUMLはソースのまま埋め込んでいます（描画はVSCode拡張やPlantUMLサーバで）")
+    return 0
 
 
 # ---------------------------------------------------------------- 入力の点検
@@ -269,6 +419,13 @@ def selftest() -> int:
     rows = table_data_rows("|a|b|\n|---|---|\n|1|2|\n|3|4|\n")
     t("表パーサ: データ行を正しく数える", len(rows) == 2)
 
+    # 4.5) HTML出力（--html）。1枚に全ノードが入り、.mdリンクがアンカー化されること
+    html = build_html(REFERENCE)
+    t("HTML出力: ルートの題とPlantUMLソースを含む",
+      "フラクタル設計書ジェネレータ" in html and "@startuml" in html)
+    t("HTML出力: .mdへのリンクが残らずアンカー化される",
+      ".md\"" not in html and 'href="#01_設計/要素1_目的"' in html)
+
     # 5) 入力の点検（--gaps）。生成はせず、何が書かれていないかだけを返すこと
     full = analyze_gaps((ROOT / "corpus" / "input_full.md").read_text(encoding="utf-8"))
     thin = analyze_gaps((ROOT / "corpus" / "input_thin.md").read_text(encoding="utf-8"))
@@ -297,11 +454,15 @@ def main() -> int:
     ap.add_argument("--check", metavar="DIR")
     ap.add_argument("--gaps", metavar="FILE",
                     help="入力ファイルを点検し、何が書かれていないかを出す（生成はしない）")
+    ap.add_argument("--html", metavar="DIR",
+                    help="設計書ツリーを1枚のHTMLにまとめて DIR/index.html に出力する")
     args = ap.parse_args()
     if args.selftest:
         return selftest()
     if args.gaps:
         return run_gaps(Path(args.gaps))
+    if args.html:
+        return run_html(Path(args.html))
     if args.check:
         v = check_tree(Path(args.check))
         for x in v:
